@@ -145,7 +145,7 @@ class VAE(nn.Module):
         img_size: Union[List[int], Tuple[int]],
         latent_dim: int,
         hidden_dims: Union[List[int], Tuple[int]] = None,
-        in_channels = 3,
+        in_channels: int = 3,
         decode_activation: nn.Module = nn.Tanh(),
         return_mu_log_var: bool = True
     ) -> None:
@@ -471,7 +471,7 @@ if __name__ == '__main__':
 
         total_iters = 300000
 
-        optimizer = AdamW(model.parameters(), lr=6e-4)
+        optimizer = AdamW(model.parameters(), lr=3e-4)
         lr_scheduler = get_scheduler(
             name="linear",
             optimizer=optimizer,
