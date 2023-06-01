@@ -1,9 +1,24 @@
+import os
+import gc
+import math
+import argparse
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from PIL import Image
+from tqdm import tqdm
+
+from torch.optim import AdamW
+
+from torch.utils.data import Dataset, DataLoader
+from torchvision.transforms import Compose, ToTensor, ToPILImage
+
+from transformers import get_scheduler
+
 from types_ import *
-from decoupled_vae import Encoder, Decoder
+from decoupled_vae import Encoder, Decoder, vae_loss
 
 
 class ConditionalVAE(nn.Module):
@@ -117,7 +132,7 @@ class ConditionalVAE(nn.Module):
         """Samples from the latent space and return the corresponding image space map with specified condition.
 
         Args:
-            cond: (int): Condition variables.
+            cond: (Tensor): Condition variables.
             num_samples (int): Number of required samples.
 
         Returns:
@@ -136,13 +151,217 @@ class ConditionalVAE(nn.Module):
         
         return self.decoder(z)
 
-    def reconstruct(self, x: Tensor):
+    def reconstruct(self, x: Tensor, cond: Tensor):
         """Given input images(tensor), returns the reconstructed ones.
 
         Args:
             x (Tensor): Input tensors that come from images.
+            cond: (Tensor): Condition variables.
 
         Returns:
             Tensor: Reconstructed images.
         """
-        return self(x)[0]
+        return self(x, cond)[0]
+
+
+class MyDataset(Dataset):
+    """Custom dataset.
+
+    Args:
+        root (str): The root directory of dataset.
+        num_conds (int): Number of different types of conditions.
+        extension (str): The extension name of data file. Defaults to: .jpg.
+        transform (torchvision.transforms.Compose): A sequence that defines image transformation.
+    """
+    def __init__(self, root: str, num_conds, extension: str = ".jpg", transform: Compose = None) -> None:
+        super().__init__()
+
+        self.num_conds = num_conds
+        self.imgs = [os.path.join(root, img_file) for img_file in os.listdir(root) if img_file.endswith(extension)]
+        self.transform = transform
+
+    def __getitem__(self, index) -> Any:
+        # Returns a converted copy of the image.
+        img = Image.open(self.imgs[index]).convert("RGB")
+        if self.transform is not None:
+            img = self.transform(img)
+        
+        cond = F.one_hot(torch.as_tensor(index), num_classes=self.num_conds)
+
+        return img, cond
+
+    def __len__(self) -> int:
+        return len(self.imgs)
+    
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Everything about CVAE.")
+
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Only debug model implementation."
+    )
+    args = parser.parse_args()
+
+    return args
+
+
+if __name__ == '__main__':
+    args = parse_args()
+
+    if args.debug:
+        dev = torch.device(6)
+
+        bs = 2
+        img_size = 64
+        latent_dim = 128
+        condition_dim = 2
+
+        imgs = torch.randn(bs, 3, img_size, img_size, device=dev)
+        conds = torch.randint(0, condition_dim, (bs,), device=dev)
+        conds = F.one_hot(conds, num_classes=condition_dim)
+
+        model = ConditionalVAE(img_size, latent_dim, condition_dim)
+        model.to(dev)
+
+        outputs = model(imgs, conds)
+        loss_dict = vae_loss(imgs, *outputs)
+        print(loss_dict)
+
+        loss = loss_dict["loss"]
+        loss.backward()
+
+        del imgs, model, loss_dict, loss
+        gc.collect()
+        torch.cuda.empty_cache()
+    else:
+        dataset_dir = "/home.local/weicai/VAEs/cvae_dataset"
+        dataset = MyDataset(dataset_dir, 2, transform=Compose([ToTensor()]))
+        dataloader = DataLoader(dataset, batch_size=2, shuffle=True, pin_memory=True, num_workers=2)
+
+        dev = torch.device(0)
+
+        latent_dim = 256
+        img_size = dataset[0][0].shape[-2:]
+        condition_dim = dataset[0][1].size(-1)
+
+        model = ConditionalVAE(img_size, latent_dim, condition_dim)
+        model.to(dev)
+
+        total_iters = 500000
+        gradient_accumulation_steps = 5
+
+        optimizer = AdamW(model.parameters(), lr=3e-4)
+        lr_scheduler = get_scheduler(
+            "linear",
+            optimizer,
+            num_warmup_steps=0,
+            num_training_steps=total_iters // gradient_accumulation_steps
+        )
+
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+
+        ckpt_dir = "cvae_checkpoints"
+        os.makedirs(ckpt_dir, exist_ok=True)
+
+        kl_weight = 1.0
+        log_freq, save_freq = 50, 50000
+        best_reconstruct = best_kl_div = math.inf
+
+        for i in tqdm(range(total_iters), desc="Training CVAE"):
+            for imgs, conds in dataloader:
+                imgs = imgs.to(dev)
+                conds = conds.to(dev)
+                reconstructed, mu, log_var = model(imgs, conds)
+                loss_dict = vae_loss(imgs, reconstructed, mu, log_var, kl_weight=kl_weight)
+
+                loss = loss_dict['loss'] / gradient_accumulation_steps
+                loss.backward()
+
+                reconstruct_loss = loss_dict['reconstruct_loss'].item()
+                kl_div = loss_dict['kl_div'].item()
+
+                if (i + 1) % gradient_accumulation_steps == 0:
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+                
+                if reconstruct_loss < best_reconstruct:
+                    best_reconstruct = reconstruct_loss
+                    ckpt = "cvae_best_reconstruct.pt"
+                    torch.save(model.state_dict(), os.path.join(ckpt_dir, ckpt))
+                
+                if kl_div < best_kl_div:
+                    best_kl_div = kl_div
+                    ckpt = "cvae_best_kl_div.pt"
+                    torch.save(model.state_dict(), os.path.join(ckpt_dir, ckpt))
+
+                if i % log_freq == 0:
+                    print(
+                        f"Iter {i + 1}\t Lr {optimizer.param_groups[0]['lr']}\t"
+                        f"Loss {loss.item()}\t"
+                        f"Reconstruct Loss {reconstruct_loss}\t"
+                        f"KL-Div {kl_div}\n"
+                    )
+
+                if (i + 1) % save_freq == 0:
+                    reconstructed = reconstructed.detach().cpu()
+                    for j, img_ts in enumerate(reconstructed):
+                        reconstructed_img = ToPILImage()(img_ts)
+                        dst = os.path.join(dataset_dir, f"cvae_reconstruct_img_{j + 1}_iter{i + 1}.jpg")
+                        reconstructed_img.save(dst)
+                        print(f"Reconstructed image{j + 1} has been saved to: {dst}")
+                    del reconstructed
+
+        torch.cuda.empty_cache()
+        print("Training finished.")
+
+        ckpt = "cvae_last.pt"
+        torch.save(model.state_dict(), os.path.join(ckpt_dir, ckpt))
+        print(f"The last checkpoint has been save to: {ckpt}")
+
+        model.eval()
+
+        generate_sd = torch.load(os.path.join(ckpt_dir, "cvae_best_kl_div.pt"), map_location=dev)
+        model.load_state_dict(generate_sd)
+
+        num_samples = 2
+        cond = torch.randint(0, condition_dim, (num_samples,))
+        print(f"Condition for generation: {cond}")
+        one_hot_cond = F.one_hot(cond, num_classes=condition_dim)
+
+        with torch.no_grad():
+            decoded = model.generate(one_hot_cond, num_samples=num_samples)
+        
+        for sample_i, sample in enumerate(decoded):
+            sample = sample.cpu()
+            generated_img = ToPILImage()(sample)
+
+            sample_cond = cond[sample_i].item()
+            dst = os.path.join(dataset_dir, f"generated_sample_cond_{sample_cond + 1}.jpg")
+            generated_img.save(dst)
+            print(f"Generated image with condition {sample_cond + 1} has been saved to: {dst}")
+
+        torch.cuda.empty_cache()
+
+        reconstruct_sd = torch.load(os.path.join(ckpt_dir, "cvae_best_reconstruct.pt"), map_location=dev)
+        model.load_state_dict(reconstruct_sd)
+
+        for img, one_hot_cond in dataset:
+            img = img.unsqueeze(0).to(dev)
+            one_hot_cond = one_hot_cond.unsqueeze(0).to(dev)
+
+            with torch.no_grad():
+                decoded = model.reconstruct(img, one_hot_cond)
+        
+            decoded = decoded.cpu().squeeze(0)
+            reconstructed_img = ToPILImage()(decoded)
+
+            cond = cond.argmax()
+            dst = os.path.join(dataset_dir, f"reconstruct_img_cond_{cond + 1}.jpg")
+            reconstructed_img.save(dst)
+            print(f"Reconstructed image with condition {cond + 1} has been saved to: {dst}")
+        
+    print("System End.")

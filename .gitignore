@@ -8,8 +8,8 @@ __pycache__/
 
 Run.ipynb
 
-models/checkpoints/
+models/*checkpoints/
 models/*.log
 
 imgs/
-dataset/
+*dataset/

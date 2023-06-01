@@ -462,7 +462,7 @@ if __name__ == '__main__':
         img_size = dataset[0].shape[-2:]
         
         batch_size = 2
-        dataloader = DataLoader(dataset, batch_size, pin_memory=True, num_workers=2)
+        dataloader = DataLoader(dataset, batch_size, shuffle=True, pin_memory=True, num_workers=2)
 
         dev = torch.device(7)
 
