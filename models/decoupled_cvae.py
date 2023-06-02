@@ -308,11 +308,12 @@ if __name__ == '__main__':
 
                 if (i + 1) % save_freq == 0:
                     reconstructed = reconstructed.detach().cpu()
-                    for j, img_ts in enumerate(reconstructed):
+                    for img_ts, one_hot_cond in zip(reconstructed, conds):
                         reconstructed_img = ToPILImage()(img_ts)
-                        dst = os.path.join(dataset_dir, f"cvae_reconstruct_img_{j + 1}_iter{i + 1}.jpg")
+                        cond = one_hot_cond.argmax()
+                        dst = os.path.join(dataset_dir, f"cvae_reconstruct_img_cond_{cond + 1}_iter{i + 1}.jpg")
                         reconstructed_img.save(dst)
-                        print(f"Reconstructed image{j + 1} has been saved to: {dst}")
+                        print(f"Reconstructed image with condition {cond + 1} has been saved to: {dst}")
                     del reconstructed
 
         torch.cuda.empty_cache()
@@ -323,9 +324,6 @@ if __name__ == '__main__':
         print(f"The last checkpoint has been save to: {ckpt}")
 
         model.eval()
-
-        generate_sd = torch.load(os.path.join(ckpt_dir, "cvae_best_kl_div.pt"), map_location=dev)
-        model.load_state_dict(generate_sd)
 
         num_samples = 2
         cond = torch.randint(0, condition_dim, (num_samples,))
@@ -340,9 +338,26 @@ if __name__ == '__main__':
             generated_img = ToPILImage()(sample)
 
             sample_cond = cond[sample_i].item()
+            dst = os.path.join(dataset_dir, f"final_generated_sample_cond_{sample_cond + 1}.jpg")
+            generated_img.save(dst)
+            print(f"Generated image with condition {sample_cond + 1} from final checkpoint has been saved to: {dst}")
+
+        torch.cuda.empty_cache()
+
+        generate_sd = torch.load(os.path.join(ckpt_dir, "cvae_best_kl_div.pt"), map_location=dev)
+        model.load_state_dict(generate_sd)
+
+        with torch.no_grad():
+            decoded = model.generate(one_hot_cond, num_samples=num_samples)
+        
+        for sample_i, sample in enumerate(decoded):
+            sample = sample.cpu()
+            generated_img = ToPILImage()(sample)
+
+            sample_cond = cond[sample_i].item()
             dst = os.path.join(dataset_dir, f"generated_sample_cond_{sample_cond + 1}.jpg")
             generated_img.save(dst)
-            print(f"Generated image with condition {sample_cond + 1} has been saved to: {dst}")
+            print(f"Generated image with condition {sample_cond + 1} from the best generative checkpoint has been saved to: {dst}")
 
         torch.cuda.empty_cache()
 
@@ -362,6 +377,6 @@ if __name__ == '__main__':
             cond = cond.argmax()
             dst = os.path.join(dataset_dir, f"reconstruct_img_cond_{cond + 1}.jpg")
             reconstructed_img.save(dst)
-            print(f"Reconstructed image with condition {cond + 1} has been saved to: {dst}")
+            print(f"Reconstructed image with condition {cond + 1} from the best reconstructed checkpoint has been saved to: {dst}")
         
     print("System End.")

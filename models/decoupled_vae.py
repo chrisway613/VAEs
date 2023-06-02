@@ -8,14 +8,16 @@ import torch.nn.functional as F
 
 from PIL import Image
 from tqdm import tqdm
+from functools import partial
 
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR
+from torch.optim.lr_scheduler import LambdaLR
 
 from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import Compose, ToTensor, ToPILImage
 
-from transformers import get_scheduler
+# from transformers import get_scheduler
 
 from types_ import *
 
@@ -319,6 +321,7 @@ def vae_loss(
 
 def parse_args():
     parser = argparse.ArgumentParser(description="an VAE program.")
+
     parser.add_argument(
         "--test",
         action="store_true",
@@ -328,6 +331,11 @@ def parse_args():
         "--train_1pic",
         action="store_true",
         help="Whether to train with only 1 picture."
+    )
+    parser.add_argument(
+        "--inference",
+        action="store_true",
+        help="Inference by well-trained model."
     )
     args= parser.parse_args()
 
@@ -456,6 +464,35 @@ if __name__ == '__main__':
         dst = os.path.join(data_dir, f"reconstruct.jpg")
         reconstructed_img.save(dst)
         print(f"Reconstructed image has been saved to: {dst}")
+    elif args.inference:
+        dev = torch.device(1)
+
+        dataset_dir = "/home.local/weicai/VAEs/dataset"
+        dataset = MyDataset(dataset_dir, transform=Compose([ToTensor()]))
+        img_size = dataset[0].shape[-2:]
+
+        model = VAE(img_size, 256)
+        model.to(dev)
+        model.eval()
+
+        ckpt_dir = "checkpoints"
+        ckpt = os.path.join(ckpt_dir, "last.pt")
+
+        sd = torch.load(ckpt, map_location=dev)
+        model.load_state_dict(sd)
+
+        with torch.no_grad():
+            decoded = model.generate(1)
+        
+        decoded = decoded.cpu().squeeze(0)
+        generated_img = ToPILImage()(decoded)
+
+        dst = os.path.join(dataset_dir, f"final_generate.jpg")
+        generated_img.save(dst)
+        print(f"Generated image has been saved to: {dst}")
+
+        del model, sd
+        torch.cuda.empty_cache()
     else:
         dataset_dir = "/home.local/weicai/VAEs/dataset"
         dataset = MyDataset(dataset_dir, transform=Compose([ToTensor()]))
@@ -464,44 +501,74 @@ if __name__ == '__main__':
         batch_size = 2
         dataloader = DataLoader(dataset, batch_size, shuffle=True, pin_memory=True, num_workers=2)
 
-        dev = torch.device(7)
+        dev = torch.device(6)
 
         model = VAE(img_size, 256)
         model.to(dev)
 
-        total_iters = 300000
+        total_iters = 8000
 
-        optimizer = AdamW(model.parameters(), lr=3e-4)
-        lr_scheduler = get_scheduler(
-            name="linear",
-            optimizer=optimizer,
-            num_warmup_steps=0,
-            num_training_steps=total_iters
+        def _get_linear_schedule_with_warmup_lr_lambda(
+            current_step: int, *,
+            num_warmup_steps: int,
+            num_training_steps: int,
+            min_lr: float = 1e-8
+        ):
+            if current_step < num_warmup_steps:
+                return float(current_step) / float(max(1, num_warmup_steps))
+            
+            return max(
+                min_lr,
+                float(num_training_steps - current_step) / float(max(1, num_training_steps - num_warmup_steps))
+            )
+
+        optimizer = AdamW(model.parameters(), lr=6e-4)
+        # lr_scheduler = get_scheduler(
+        #     name="linear",
+        #     optimizer=optimizer,
+        #     num_warmup_steps=0,
+        #     num_training_steps=total_iters
+        # )
+        lr_scheduler = LambdaLR(
+            optimizer,
+            partial(
+                _get_linear_schedule_with_warmup_lr_lambda,
+                num_warmup_steps=0, num_training_steps=total_iters,
+                min_lr=1e-6
+            )
         )
 
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
-        ckpt_dir = "checkpoints"
-        os.makedirs(ckpt_dir, exist_ok=True)
+        ckpt_dir = "vae_checkpoints"
+        os.makedirs(ckpt_dir)
 
-        kl_weight = 1.0
-        log_freq, save_freq = 30, 60000
+        def _get_kl_weight_schedule(
+                current_step: int, num_total_steps: int,
+                kl_weight: float = 1.0, ratio: float = 0.8
+            ):
+            linear_end = int(ratio * num_total_steps)
+            return min(kl_weight, (current_step / linear_end) * kl_weight)
+
+        output_dir = "vae_outputs"
+        os.makedirs(output_dir)
+
+        log_freq, save_freq = 200, 1000
         best_reconstruct = best_kl_div = math.inf
 
         for i in tqdm(range(total_iters), desc="Training VAE"):
             for batch in dataloader:
                 batch = batch.to(dev)
                 reconstructed, mu, log_var = model(batch)
+
+                kl_weight = _get_kl_weight_schedule(i + 1, total_iters)
                 loss_dict = vae_loss(batch, reconstructed, mu, log_var, kl_weight=kl_weight)
 
                 loss = loss_dict['loss']
                 loss.backward()
 
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-
+                loss = loss.item()
                 reconstruct_loss = loss_dict['reconstruct_loss'].item()
                 kl_div = loss_dict['kl_div'].item()
 
@@ -517,20 +584,23 @@ if __name__ == '__main__':
 
                 if i % log_freq == 0:
                     print(
-                        f"Iter {i + 1}\t Lr {optimizer.param_groups[0]['lr']}\t"
-                        f"Loss {loss.item()}\t"
-                        f"Reconstruct Loss {reconstruct_loss}\t"
-                        f"KL-Div {kl_div}\n"
+                        f"Iter {i + 1}\tLr {optimizer.param_groups[0]['lr']}\t"
+                        f"Loss {loss}\tReconstruct Loss {reconstruct_loss}\t"
+                        f"KL-Div {kl_div}\tKL Weight {kl_weight}\n"
                     )
 
                 if (i + 1) % save_freq == 0:
                     reconstructed = reconstructed.detach().cpu()
                     for j, img_ts in enumerate(reconstructed):
                         reconstructed_img = ToPILImage()(img_ts)
-                        dst = os.path.join(dataset_dir, f"reconstruct_img_{j + 1}_iter{i + 1}.jpg")
+                        dst = os.path.join(output_dir, f"reconstruct_img_{j + 1}_iter{i + 1}.jpg")
                         reconstructed_img.save(dst)
                         print(f"Reconstructed image{j + 1} has been saved to: {dst}")
                     del reconstructed
+                
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
 
         torch.cuda.empty_cache()
         print("Training finished.")
@@ -540,6 +610,15 @@ if __name__ == '__main__':
         print(f"The last checkpoint has been save to: {ckpt}")
 
         model.eval()
+        with torch.no_grad():
+            decoded = model.generate(1)
+        
+        decoded = decoded.cpu().squeeze(0)
+        generated_img = ToPILImage()(decoded)
+
+        dst = os.path.join(output_dir, f"final_generate.jpg")
+        generated_img.save(dst)
+        print(f"Generated image from final checkpoint has been saved to: {dst}")
 
         generate_sd = torch.load(os.path.join(ckpt_dir, "best_kl_div.pt"), map_location=dev)
         model.load_state_dict(generate_sd)
@@ -550,9 +629,9 @@ if __name__ == '__main__':
         decoded = decoded.cpu().squeeze(0)
         generated_img = ToPILImage()(decoded)
 
-        dst = os.path.join(dataset_dir, f"generate.jpg")
+        dst = os.path.join(output_dir, f"best_generate.jpg")
         generated_img.save(dst)
-        print(f"Generated image has been saved to: {dst}")
+        print(f"Generated image from best generative checkpoint has been saved to: {dst}")
 
         torch.cuda.empty_cache()
 
@@ -567,8 +646,8 @@ if __name__ == '__main__':
             decoded = decoded.cpu().squeeze(0)
             reconstructed_img = ToPILImage()(decoded)
 
-            dst = os.path.join(dataset_dir, f"reconstruct_img{k}.jpg")
+            dst = os.path.join(output_dir, f"reconstruct_img{k}.jpg")
             reconstructed_img.save(dst)
-            print(f"Reconstructed image{k} has been saved to: {dst}")
+            print(f"Reconstructed image{k} from best reconstructed checkpoint has been saved to: {dst}")
         
-        print("System End.")
+    print("System End.")
