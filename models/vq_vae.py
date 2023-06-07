@@ -4,6 +4,7 @@ from torch import nn
 from torch.nn import functional as F
 from .types_ import *
 
+
 class VectorQuantizer(nn.Module):
     """
     Reference:
@@ -20,7 +21,7 @@ class VectorQuantizer(nn.Module):
 
         self.embedding = nn.Embedding(self.K, self.D)
         self.embedding.weight.data.uniform_(-1 / self.K, 1 / self.K)
-
+    
     def forward(self, latents: Tensor) -> Tensor:
         latents = latents.permute(0, 2, 3, 1).contiguous()  # [B x D x H x W] -> [B x H x W x D]
         latents_shape = latents.shape

@@ -10,6 +10,7 @@ Run.ipynb
 
 models/*checkpoints/
 models/*.log
+models/*outputs/
 
 imgs/
 *dataset/
