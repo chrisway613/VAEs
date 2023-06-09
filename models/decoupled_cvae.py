@@ -147,7 +147,7 @@ class ConditionalVAE(nn.Module):
         cond = cond.to(dev)
 
         z = torch.randn(num_samples, self.latent_dim, device=dev)
-        z = self._conditioned_latent(z)
+        z = self._conditioned_latent(z, cond)
         
         return self.decoder(z)
 
@@ -249,10 +249,10 @@ if __name__ == '__main__':
         model = ConditionalVAE(img_size, latent_dim, condition_dim)
         model.to(dev)
 
-        total_iters = 500000
-        gradient_accumulation_steps = 5
+        total_iters = 360000  # 500000
+        gradient_accumulation_steps = 6  # 5
 
-        optimizer = AdamW(model.parameters(), lr=3e-4)
+        optimizer = AdamW(model.parameters(), lr=4e-4)  # 3e-4
         lr_scheduler = get_scheduler(
             "linear",
             optimizer,
@@ -264,10 +264,13 @@ if __name__ == '__main__':
         optimizer.zero_grad(set_to_none=True)
 
         ckpt_dir = "cvae_checkpoints"
-        os.makedirs(ckpt_dir, exist_ok=True)
+        os.makedirs(ckpt_dir)
+
+        output_dir = "cvae_outputs"
+        os.makedirs(output_dir)
 
         kl_weight = 1.0
-        log_freq, save_freq = 50, 50000
+        log_freq, save_freq = 60, 60000
         best_reconstruct = best_kl_div = math.inf
 
         for i in tqdm(range(total_iters), desc="Training CVAE"):
@@ -280,14 +283,18 @@ if __name__ == '__main__':
                 loss = loss_dict['loss'] / gradient_accumulation_steps
                 loss.backward()
 
+                loss = loss_dict['loss'].item()
                 reconstruct_loss = loss_dict['reconstruct_loss'].item()
                 kl_div = loss_dict['kl_div'].item()
-
-                if (i + 1) % gradient_accumulation_steps == 0:
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
                 
+                if i % log_freq == 0:
+                    print(
+                        f"Iter {i + 1}\t Lr {optimizer.param_groups[0]['lr']}\t"
+                        f"Loss {loss}\t"
+                        f"Reconstruct Loss {reconstruct_loss}\t"
+                        f"KL-Div {kl_div}\n"
+                    )
+
                 if reconstruct_loss < best_reconstruct:
                     best_reconstruct = reconstruct_loss
                     ckpt = "cvae_best_reconstruct.pt"
@@ -298,23 +305,20 @@ if __name__ == '__main__':
                     ckpt = "cvae_best_kl_div.pt"
                     torch.save(model.state_dict(), os.path.join(ckpt_dir, ckpt))
 
-                if i % log_freq == 0:
-                    print(
-                        f"Iter {i + 1}\t Lr {optimizer.param_groups[0]['lr']}\t"
-                        f"Loss {loss.item()}\t"
-                        f"Reconstruct Loss {reconstruct_loss}\t"
-                        f"KL-Div {kl_div}\n"
-                    )
-
                 if (i + 1) % save_freq == 0:
                     reconstructed = reconstructed.detach().cpu()
                     for img_ts, one_hot_cond in zip(reconstructed, conds):
                         reconstructed_img = ToPILImage()(img_ts)
                         cond = one_hot_cond.argmax()
-                        dst = os.path.join(dataset_dir, f"cvae_reconstruct_img_cond_{cond + 1}_iter{i + 1}.jpg")
+                        dst = os.path.join(output_dir, f"cvae_reconstruct_img_cond_{cond + 1}_iter{i + 1}.jpg")
                         reconstructed_img.save(dst)
                         print(f"Reconstructed image with condition {cond + 1} has been saved to: {dst}")
                     del reconstructed
+                
+                if (i + 1) % gradient_accumulation_steps == 0:
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
 
         torch.cuda.empty_cache()
         print("Training finished.")
@@ -338,7 +342,7 @@ if __name__ == '__main__':
             generated_img = ToPILImage()(sample)
 
             sample_cond = cond[sample_i].item()
-            dst = os.path.join(dataset_dir, f"final_generated_sample_cond_{sample_cond + 1}.jpg")
+            dst = os.path.join(output_dir, f"final_generated_sample_cond_{sample_cond + 1}.jpg")
             generated_img.save(dst)
             print(f"Generated image with condition {sample_cond + 1} from final checkpoint has been saved to: {dst}")
 
@@ -355,7 +359,7 @@ if __name__ == '__main__':
             generated_img = ToPILImage()(sample)
 
             sample_cond = cond[sample_i].item()
-            dst = os.path.join(dataset_dir, f"generated_sample_cond_{sample_cond + 1}.jpg")
+            dst = os.path.join(output_dir, f"generated_sample_cond_{sample_cond + 1}.jpg")
             generated_img.save(dst)
             print(f"Generated image with condition {sample_cond + 1} from the best generative checkpoint has been saved to: {dst}")
 
@@ -375,7 +379,7 @@ if __name__ == '__main__':
             reconstructed_img = ToPILImage()(decoded)
 
             cond = cond.argmax()
-            dst = os.path.join(dataset_dir, f"reconstruct_img_cond_{cond + 1}.jpg")
+            dst = os.path.join(output_dir, f"reconstruct_img_cond_{cond + 1}.jpg")
             reconstructed_img.save(dst)
             print(f"Reconstructed image with condition {cond + 1} from the best reconstructed checkpoint has been saved to: {dst}")
         

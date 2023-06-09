@@ -1,4 +1,6 @@
 import gc
+import os
+import math
 import logging
 import argparse
 
@@ -6,7 +8,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from torch.optim import AdamW
+from torchvision.transforms import Compose, ToTensor
+
+from transformers.optimization import get_scheduler
+
 from types_ import *
+
+from decoupled_vq_vae import VQVAE
+from decoupled_vae import MyDataset
 
 
 logger = logging.getLogger(__name__)
@@ -213,6 +223,95 @@ if __name__ == '__main__':
         gc.collect()
         torch.cuda.empty_cache()
     else:
-        pass
+        dev = torch.device(1)
+
+        dataset_dir = "/home.local/weicai/VAEs/dataset"
+        dataset = MyDataset(dataset_dir, transform=Compose([ToTensor()]))
+        img_size = dataset[0].shape[-2:]
+
+        embed_dim = 64
+        num_embeddings = 512
+
+        with StateStdout(logger=logger, begin="Loading VQ-VAE model..", end="Done!"):
+            vq_vae = VQVAE(img_size, embed_dim, num_embeddings)
+            vq_vae.eval()
+            vq_vae.to(dev)
+        
+            ckpt = "/home.local/weicai/VAEs/models/vq_vae_ckpt/best.pt"
+            sd = torch.load(ckpt, map_location=dev)
+            vq_vae.load_state_dict(sd)
+
+        with StateStdout(logger=logger, begin="Collecting embedding indices..", end="Done!"):
+            embed_indices = []
+            for img_ts in dataset:
+                img_ts = img_ts.unsqueeze(0).to(dev)
+                with torch.no_grad():
+                    latent = vq_vae.encoder(img_ts)
+
+                # (b, d, h, w) -> (b, h, w, d)
+                latent = latent.permute(0, 2, 3, 1).contiguous()
+                b, h, w, d = latent.shape
+                # (b, h, w, d) -> (b * h * w, d)
+                latent = latent.reshape(-1, d)
+                
+                # (b * h * w,)
+                embed_ind = vq_vae.vq_layer.get_embed_indices(latent)
+                # (b * h * w,) -> (b, h, w)
+                embed_ind = embed_ind.reshape(b, h, w).cpu()
+                embed_indices.append(embed_ind)
+        
+        with StateStdout(logger=logger, begin="Loading GatedPixelCNN model..", end="Done!"):
+            model = GatedPixelCNN(num_embeddings, embed_dim, num_embeddings)
+            model.to(dev)
+
+        total_steps = 1600
+        optimizer = AdamW(model.parameters(), lr=1e-3)
+        lr_scheduler = get_scheduler(
+            "linear",
+            optimizer,
+            num_warmup_steps=0,
+            num_training_steps=total_steps
+        )
+
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+
+        ckpt_dir = "gated_pixel_cnn_ckpt"
+        os.makedirs(ckpt_dir)
+
+        with StateStdout(logger=logger, begin="Training GatedPixelCNN.."):
+            best = math.inf
+            for step in range(total_steps):
+                mean_loss = 0.
+                for ind in embed_indices:
+                    ind = ind.to(dev)
+                    # (b, h, w) -> (b, h, w, c)
+                    one_hot_ind = F.one_hot(ind, num_classes=num_embeddings)
+                    # (b, h, w, c) -> (b, c, h, w)
+                    # long -> float32
+                    one_hot_ind = one_hot_ind.permute(0, 3, 1, 2).contiguous().float()
+
+                    logit = model(one_hot_ind)
+
+                    loss = F.cross_entropy(logit, ind) / len(embed_indices)
+                    loss.backward()
+                    
+                    loss = loss.item()
+                    mean_loss += loss
+
+                if mean_loss < best:
+                    best = mean_loss
+                    torch.save(model.state_dict(), os.path.join(ckpt_dir, "best.pt"))
+
+                if step % 10 == 0:
+                    print(f"Step [{step + 1}/{total_steps}]\tLoss {mean_loss}\tLr {optimizer.param_groups[0]['lr']}")
+
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+        
+            dst = os.path.join(ckpt_dir, "last.pt")
+            torch.save(model.state_dict(), dst)
+            print(f"The last checkpoint has been saved to: {dst}")
 
     print("System End.")

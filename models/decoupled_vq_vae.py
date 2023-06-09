@@ -1,11 +1,51 @@
+import os
 import gc
+import math
+import logging
 import argparse
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tqdm import tqdm
+
+from torch.optim import AdamW
+from transformers import get_scheduler
+
+from torch.utils.data import DataLoader
+from torchvision.transforms import Compose, ToTensor, ToPILImage
+
 from types_ import *
+from decoupled_vae import MyDataset
+
+
+logger = logging.getLogger(__name__)
+logger.setLevel('INFO')
+logger.addHandler(logging.StreamHandler())
+
+
+class StateStdout:
+    def __init__(self, logger: logging.Logger = None, begin: str = "Start", end: str = "Done") -> None:
+        self.logger = logger
+        self.begin = begin
+        self.end = end
+    
+    def __enter__(self):
+        if self.logger is None:
+            print(self.begin)
+        else:
+            self.logger.info(self.begin)
+
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.logger is None:
+            print(self.end)
+        else:
+            self.logger.info(self.end)
+
+        return True
 
 
 class VectorQuantizer(nn.Module):
@@ -247,7 +287,14 @@ class VQVAE(nn.Module):
         
         return outputs
 
-    def compute_loss(self, outputs: Tensor, original: Tensor, reconstruct_loss_type: str = "mse", return_dict: bool = True):
+    def compute_loss(
+        self,
+        outputs: Tuple[Tensor],
+        original: Tensor,
+        reconstruct_loss_type: str = "mse",
+        vq_loss_weight: float = 1.0,
+        return_dict: bool = True
+    ):
         reconstructed = outputs[0]
         if reconstruct_loss_type == "mse":
             reconstruct_loss = F.mse_loss(reconstructed, original)
@@ -260,7 +307,7 @@ class VQVAE(nn.Module):
         if self.vq_layer.training:
             vq_loss = outputs[-1]
         
-        loss = reconstruct_loss + vq_loss
+        loss = reconstruct_loss + vq_loss * vq_loss_weight
         if return_dict:
             return {
                 "loss": loss,
@@ -285,6 +332,11 @@ def parse_args():
         "--debug",
         action="store_true",
         help="Only debug model implementation."
+    )
+    parser.add_argument(
+        "--sample",
+        action="store_true",
+        help="Do inference for well-trained model."
     )
     args = parser.parse_args()
 
@@ -316,7 +368,180 @@ if __name__ == '__main__':
         del loss, loss_dict, model, img_ts
         gc.collect()
         torch.cuda.empty_cache()
+    elif args.sample:
+        dev = torch.device(1)
+
+        dataset_dir = "/home.local/weicai/VAEs/dataset"
+        dataset = MyDataset(dataset_dir, transform=Compose([ToTensor()]))
+        img_size = dataset[0].shape[-2:]
+
+        embed_dim = 64
+        num_embeddings = 512
+        hidden_dims = [128, 256]
+
+        from gated_pixel_cnn import GatedPixelCNN
+
+        with StateStdout(logger=logger, begin="Loading GatedPixelCNN model..", end="Done!"):
+            gated_pixel_cnn = GatedPixelCNN(num_embeddings, embed_dim, num_embeddings)
+            gated_pixel_cnn.eval()
+
+            sd = torch.load("gated_pixel_cnn_ckpt/best.pt", map_location="cpu")
+            gated_pixel_cnn.load_state_dict(sd)
+            gated_pixel_cnn.to(dev)
+
+            del sd
+
+        with StateStdout(logger=logger, begin="Sampling priors by GatedPixelCNN..", end="Done!"):
+            num_samples = 8
+            prior_size = (img_size[0] // (2 ** len(hidden_dims)), img_size[1] // (2 ** len(hidden_dims)))
+            priors = torch.randint(0, num_embeddings, (num_samples,) + prior_size, device=dev)
+            for row in range(img_size[0]):
+                for col in range(img_size[1]):
+                    # (num_samples, h, w) -> (num_samples, h, w, num_embeddings)
+                    one_hot_priors = F.one_hot(priors, num_classes=num_embeddings)
+                    # (num_samples, h, w, num_embeddings) -> (num_samples, num_embeddings, h, w)
+                    # long -> float32
+                    one_hot_priors = one_hot_priors.permute(0, 3, 1, 2).contiguous().float()
+                    
+                    pixel_logits = gated_pixel_cnn(one_hot_priors)[:, :, row, col]
+                    pixel_probs = F.softmax(pixel_logits, dim=-1)
+                    pixel_values = torch.multinomial(pixel_probs, 1).squeeze(-1)
+
+                    priors[:, row, col] = pixel_values
+
+            del gated_pixel_cnn
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        with StateStdout(logger=logger, begin="Loading VQ-VAE model..", end="Done!"):
+            model = VQVAE(img_size, embed_dim, num_embeddings, hidden_dims=hidden_dims)
+            model.eval()
+
+            sd = torch.load("vq_vae_ckpt/best.pt", map_location="cpu")
+            model.load_state_dict(sd)
+            model.to(dev)
+
+            del sd
+            gc.collect()
+
+        with StateStdout(logger=logger, begin="Decoding from priors..", end="Done!"):
+            with torch.no_grad():
+                z = model.vq_layer.quantize(priors)
+                z = z.permute(0, 3, 1, 2).contiguous()
+                decoded = model.decoder(z)
+            del z, priors
+        
+        with StateStdout(logger=logger, begin="Saving images..", end="Done!"):
+            output_dir = "vq_vae_generated"
+            os.makedirs(output_dir)
+
+            for i, generated_ts in enumerate(decoded):
+                generated_ts = generated_ts.cpu()
+                img = ToPILImage()(generated_ts)
+                dst = os.path.join(output_dir, f"generated_img_{i + 1}.jpg")
+                img.save(dst)
+
+                print(f"Image {i + 1} generated by VQ-VAE has been saved to: {dst}")
+            
+            del decoded
+        
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
     else:
-        pass
+        dev = torch.device(1)
+
+        dataset_dir = "/home.local/weicai/VAEs/dataset"
+        dataset = MyDataset(dataset_dir, transform=Compose([ToTensor()]))
+        img_size = dataset[0].shape[-2:]
+
+        bs = 2
+        dataloader = DataLoader(dataset, batch_size=2, shuffle=True, pin_memory=True, num_workers=2)
+
+        embed_dim = 64
+        num_embeddings = 512
+
+        model = VQVAE(img_size, embed_dim, num_embeddings)
+        model.to(dev)
+
+        total_iters = 20000
+        gradient_accumulation_steps = 1
+
+        optimizer = AdamW(model.parameters(), lr=3e-4)
+        lr_scheduler = get_scheduler(
+            "linear",
+            optimizer,
+            num_warmup_steps=0,
+            num_training_steps=total_iters // gradient_accumulation_steps
+        )
+
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+
+        ckpt_dir = "vq_vae_ckpt"
+        os.makedirs(ckpt_dir)
+
+        output_dir = "vq_vae_outputs"
+        os.makedirs(output_dir)
+
+        best = math.inf
+        log_freq, save_freq = 200, 4000
+
+        for step in tqdm(range(total_iters), desc="Training VQ-VAE"):
+            for imgs in dataloader:
+                imgs = imgs.to(dev)
+                outputs = model(imgs)
+
+                loss_dict = model.compute_loss(outputs, imgs, vq_loss_weight=1)
+                loss = loss_dict["loss"] / gradient_accumulation_steps
+                loss.backward()
+
+                loss = loss_dict["loss"].item()
+                reconstruct_loss = loss_dict["reconstruct_loss"].item()
+                vq_loss = loss_dict["vq_loss"].item()
+
+                if step % log_freq == 0:
+                    print(
+                        f"Step {step + 1}/{total_iters}\tLr {optimizer.param_groups[0]['lr']}\t"
+                        f"Loss {loss}\tReconstruction Loss {reconstruct_loss}\tVQ Loss {vq_loss}\n"
+                    )
+
+                if loss < best:
+                    best = loss
+                    torch.save(model.state_dict(), os.path.join(ckpt_dir, "best.pt"))
+                
+                if (step + 1) % save_freq == 0:
+                    reconstructed = outputs[0].detach().cpu()
+                    for i, img_ts in enumerate(reconstructed):
+                        img = ToPILImage()(img_ts)
+                        dst = os.path.join(output_dir, f"reconstruct_img_{i + 1}_step_{step + 1}.jpg")
+                        img.save(dst)
+                        print(f"Reconstructed image{i + 1} has been saved to: {dst}")
+                    del reconstructed
+                
+                if (step + 1) % gradient_accumulation_steps == 0:
+                    optimizer.step()
+                    lr_scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
+        
+        torch.cuda.empty_cache()
+        print("Training Finished.")
+
+        dst = os.path.join(ckpt_dir, "last.pt")
+        torch.save(model.state_dict(), dst)
+        print(f"Last checkpoint has been saved to: {dst}")
+
+        model.eval()
+
+        for j, img_ts in enumerate(dataset):
+            img_ts = img_ts.unsqueeze(0).to(dev)
+            with torch.no_grad():
+                reconstructed = model.reconstruct(img_ts)
+            reconstructed = reconstructed.cpu().squeeze(0)
+
+            img = ToPILImage()(reconstructed)
+            dst = os.path.join(output_dir, f"fina_reconstructed_img_{j + 1}.jpg")
+            img.save(dst)
+            print(f"Image {j + 1} reconstructed by the last checkpoint has been saved to: {dst}")
 
     print("System End.")
