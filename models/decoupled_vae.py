@@ -11,8 +11,7 @@ from tqdm import tqdm
 from functools import partial
 
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import LinearLR
-from torch.optim.lr_scheduler import LambdaLR
+from torch.optim.lr_scheduler import LinearLR, LambdaLR
 
 from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import Compose, ToTensor, ToPILImage

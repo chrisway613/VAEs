@@ -338,6 +338,11 @@ def parse_args():
         action="store_true",
         help="Do inference for well-trained model."
     )
+    parser.add_argument(
+        "--use_encoded_embeddings",
+        action="store_true",
+        help="Use encoded embedding indices as priors."
+    )
     args = parser.parse_args()
 
     return args
@@ -379,39 +384,48 @@ if __name__ == '__main__':
         num_embeddings = 512
         hidden_dims = [128, 256]
 
-        from gated_pixel_cnn import GatedPixelCNN
+        if args.use_encoded_embeddings:
+            with StateStdout(logger=logger, begin="Loading priors..", end="Done!"):
+                priors = torch.load("embedding_indices", map_location=dev)
+                output_dir = "vq_vae_generate_from_encoded_indices"
+        else:
+            from gated_pixel_cnn import GatedPixelCNN
 
-        with StateStdout(logger=logger, begin="Loading GatedPixelCNN model..", end="Done!"):
-            gated_pixel_cnn = GatedPixelCNN(num_embeddings, embed_dim, num_embeddings)
-            gated_pixel_cnn.eval()
+            with StateStdout(logger=logger, begin="Loading GatedPixelCNN model..", end="Done!"):
+                gated_pixel_cnn = GatedPixelCNN(num_embeddings, num_embeddings, num_embeddings)
+                gated_pixel_cnn.eval()
 
-            sd = torch.load("gated_pixel_cnn_ckpt/best.pt", map_location="cpu")
-            gated_pixel_cnn.load_state_dict(sd)
-            gated_pixel_cnn.to(dev)
+                sd = torch.load("gated_pixel_cnn_ckpt_embed_dim_512_lr_4e-3_no_avg_grad_iter_3w/best.pt", map_location="cpu")
+                gated_pixel_cnn.load_state_dict(sd)
+                gated_pixel_cnn.to(dev)
 
-            del sd
+                del sd
 
-        with StateStdout(logger=logger, begin="Sampling priors by GatedPixelCNN..", end="Done!"):
-            num_samples = 8
-            prior_size = (img_size[0] // (2 ** len(hidden_dims)), img_size[1] // (2 ** len(hidden_dims)))
-            priors = torch.randint(0, num_embeddings, (num_samples,) + prior_size, device=dev)
-            for row in range(img_size[0]):
-                for col in range(img_size[1]):
-                    # (num_samples, h, w) -> (num_samples, h, w, num_embeddings)
-                    one_hot_priors = F.one_hot(priors, num_classes=num_embeddings)
-                    # (num_samples, h, w, num_embeddings) -> (num_samples, num_embeddings, h, w)
-                    # long -> float32
-                    one_hot_priors = one_hot_priors.permute(0, 3, 1, 2).contiguous().float()
-                    
-                    pixel_logits = gated_pixel_cnn(one_hot_priors)[:, :, row, col]
-                    pixel_probs = F.softmax(pixel_logits, dim=-1)
-                    pixel_values = torch.multinomial(pixel_probs, 1).squeeze(-1)
+            with StateStdout(logger=logger, begin="Sampling priors by GatedPixelCNN..", end="Done!"):
+                num_samples = 1
+                prior_size = (img_size[0] // (2 ** len(hidden_dims)), img_size[1] // (2 ** len(hidden_dims)))
+                priors = torch.randint(0, num_embeddings, (num_samples,) + prior_size, device=dev)
+                # priors = torch.zeros((num_samples,) + prior_size, dtype=torch.long, device=dev)
+                for row in range(prior_size[0]):
+                    for col in range(prior_size[1]):
+                        # (num_samples, h, w) -> (num_samples, h, w, num_embeddings)
+                        one_hot_priors = F.one_hot(priors, num_classes=num_embeddings)
+                        # (num_samples, h, w, num_embeddings) -> (num_samples, num_embeddings, h, w)
+                        # long -> float32
+                        one_hot_priors = one_hot_priors.permute(0, 3, 1, 2).contiguous().float()
+                        
+                        with torch.no_grad():
+                            pixel_logits = gated_pixel_cnn(one_hot_priors)[:, :, row, col]
+                        pixel_probs = F.softmax(pixel_logits, dim=-1)
+                        pixel_values = torch.multinomial(pixel_probs, 1).squeeze(-1)
 
-                    priors[:, row, col] = pixel_values
+                        priors[:, row, col] = pixel_values
 
             del gated_pixel_cnn
             gc.collect()
             torch.cuda.empty_cache()
+            
+            output_dir = "vq_vae_generate_from_priors_embed_2048"
 
         with StateStdout(logger=logger, begin="Loading VQ-VAE model..", end="Done!"):
             model = VQVAE(img_size, embed_dim, num_embeddings, hidden_dims=hidden_dims)
@@ -429,22 +443,19 @@ if __name__ == '__main__':
                 z = model.vq_layer.quantize(priors)
                 z = z.permute(0, 3, 1, 2).contiguous()
                 decoded = model.decoder(z)
+                print(decoded.size())
             del z, priors
-        
-        with StateStdout(logger=logger, begin="Saving images..", end="Done!"):
-            output_dir = "vq_vae_generated"
-            os.makedirs(output_dir)
 
+        with StateStdout(logger=logger, begin="Saving images..", end="Done!"):
+            os.makedirs(output_dir)
             for i, generated_ts in enumerate(decoded):
                 generated_ts = generated_ts.cpu()
                 img = ToPILImage()(generated_ts)
                 dst = os.path.join(output_dir, f"generated_img_{i + 1}.jpg")
                 img.save(dst)
-
-                print(f"Image {i + 1} generated by VQ-VAE has been saved to: {dst}")
-            
+                print(f"Image {i + 1} generated by VQ-VAE has been saved to: {dst}")            
             del decoded
-        
+
         del model
         gc.collect()
         torch.cuda.empty_cache()
@@ -540,7 +551,7 @@ if __name__ == '__main__':
             reconstructed = reconstructed.cpu().squeeze(0)
 
             img = ToPILImage()(reconstructed)
-            dst = os.path.join(output_dir, f"fina_reconstructed_img_{j + 1}.jpg")
+            dst = os.path.join(output_dir, f"final_reconstructed_img_{j + 1}.jpg")
             img.save(dst)
             print(f"Image {j + 1} reconstructed by the last checkpoint has been saved to: {dst}")
 

@@ -146,6 +146,7 @@ class ConditionalVAE(nn.Module):
             cond = F.one_hot(cond, num_classes=self.condition_dim)
         cond = cond.to(dev)
 
+        num_samples = cond.size(0)
         z = torch.randn(num_samples, self.latent_dim, device=dev)
         z = self._conditioned_latent(z, cond)
         
@@ -249,10 +250,10 @@ if __name__ == '__main__':
         model = ConditionalVAE(img_size, latent_dim, condition_dim)
         model.to(dev)
 
-        total_iters = 360000  # 500000
-        gradient_accumulation_steps = 6  # 5
+        total_iters = 500000
+        gradient_accumulation_steps = 5
 
-        optimizer = AdamW(model.parameters(), lr=4e-4)  # 3e-4
+        optimizer = AdamW(model.parameters(), lr=3e-4)
         lr_scheduler = get_scheduler(
             "linear",
             optimizer,
@@ -270,7 +271,7 @@ if __name__ == '__main__':
         os.makedirs(output_dir)
 
         kl_weight = 1.0
-        log_freq, save_freq = 60, 60000
+        log_freq, save_freq = 500, 100000
         best_reconstruct = best_kl_div = math.inf
 
         for i in tqdm(range(total_iters), desc="Training CVAE"):
@@ -330,7 +331,8 @@ if __name__ == '__main__':
         model.eval()
 
         num_samples = 2
-        cond = torch.randint(0, condition_dim, (num_samples,))
+        # cond = torch.randint(0, condition_dim, (num_samples,))
+        cond = torch.tensor([0, 1])
         print(f"Condition for generation: {cond}")
         one_hot_cond = F.one_hot(cond, num_classes=condition_dim)
 
@@ -378,8 +380,8 @@ if __name__ == '__main__':
             decoded = decoded.cpu().squeeze(0)
             reconstructed_img = ToPILImage()(decoded)
 
-            cond = cond.argmax()
-            dst = os.path.join(output_dir, f"reconstruct_img_cond_{cond + 1}.jpg")
+            reconstruct_cond = one_hot_cond.argmax(dim=-1).item()
+            dst = os.path.join(output_dir, f"final_reconstruct_img_cond_{reconstruct_cond + 1}.jpg")
             reconstructed_img.save(dst)
             print(f"Reconstructed image with condition {cond + 1} from the best reconstructed checkpoint has been saved to: {dst}")
         

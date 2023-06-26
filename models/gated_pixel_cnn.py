@@ -1,6 +1,7 @@
 import gc
 import os
 import math
+import random
 import logging
 import argparse
 
@@ -8,7 +9,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from functools import partial
+
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
 from torchvision.transforms import Compose, ToTensor
 
 from transformers.optimization import get_scheduler
@@ -162,6 +166,11 @@ def parse_args():
         action="store_true",
         help="Only for verify model implementation."
     )
+    parser.add_argument(
+        "--dump_embedding_indices",
+        action="store_true",
+        help="Dump embedding indices."
+    )
     args = parser.parse_args()
 
     return args
@@ -223,7 +232,7 @@ if __name__ == '__main__':
         gc.collect()
         torch.cuda.empty_cache()
     else:
-        dev = torch.device(1)
+        dev = torch.device(7)
 
         dataset_dir = "/home.local/weicai/VAEs/dataset"
         dataset = MyDataset(dataset_dir, transform=Compose([ToTensor()]))
@@ -259,24 +268,51 @@ if __name__ == '__main__':
                 # (b * h * w,) -> (b, h, w)
                 embed_ind = embed_ind.reshape(b, h, w).cpu()
                 embed_indices.append(embed_ind)
+            
+            if args.dump_embedding_indices:
+                torch.save(torch.cat(embed_indices), "embedding_indices")
+                logger.info(f"NOTE: embedding indices has been saved to: 'embedding_indices'")
         
         with StateStdout(logger=logger, begin="Loading GatedPixelCNN model..", end="Done!"):
-            model = GatedPixelCNN(num_embeddings, embed_dim, num_embeddings)
+            model = GatedPixelCNN(num_embeddings, num_embeddings, num_embeddings)
             model.to(dev)
 
-        total_steps = 1600
-        optimizer = AdamW(model.parameters(), lr=1e-3)
-        lr_scheduler = get_scheduler(
-            "linear",
+        total_steps = 30000
+        optimizer = AdamW(model.parameters(), lr=4e-3)
+        # lr_scheduler = get_scheduler(
+        #     "linear",
+        #     optimizer,
+        #     num_warmup_steps=0,
+        #     num_training_steps=total_steps
+        # )
+
+        def _get_linear_schedule_with_warmup_lr_lambda(
+            current_step: int, *,
+            num_warmup_steps: int,
+            num_training_steps: int,
+            min_lr: float = 1e-8
+        ):
+            if current_step < num_warmup_steps:
+                return float(current_step) / float(max(1, num_warmup_steps))
+            
+            return max(
+                min_lr,
+                float(num_training_steps - current_step) / float(max(1, num_training_steps - num_warmup_steps))
+            )
+        
+        lr_scheduler = LambdaLR(
             optimizer,
-            num_warmup_steps=0,
-            num_training_steps=total_steps
+            partial(
+                _get_linear_schedule_with_warmup_lr_lambda,
+                num_warmup_steps=0, num_training_steps=total_steps,
+                min_lr=1e-6
+            )
         )
 
         model.train()
         optimizer.zero_grad(set_to_none=True)
 
-        ckpt_dir = "gated_pixel_cnn_ckpt"
+        ckpt_dir = "gated_pixel_cnn_ckpt_embed_dim_512_lr_4e-3_no_avg_grad_iter_3w"
         os.makedirs(ckpt_dir)
 
         with StateStdout(logger=logger, begin="Training GatedPixelCNN.."):
@@ -293,22 +329,30 @@ if __name__ == '__main__':
 
                     logit = model(one_hot_ind)
 
-                    loss = F.cross_entropy(logit, ind) / len(embed_indices)
+                    # loss = F.cross_entropy(logit, ind) / len(embed_indices)
+                    # loss.backward()
+                    
+                    # loss = loss.item()
+                    # mean_loss += loss
+
+                    loss = F.cross_entropy(logit, ind)
                     loss.backward()
                     
-                    loss = loss.item()
+                    loss = loss.item() / len(embed_indices)
                     mean_loss += loss
 
                 if mean_loss < best:
                     best = mean_loss
                     torch.save(model.state_dict(), os.path.join(ckpt_dir, "best.pt"))
 
-                if step % 10 == 0:
+                if step % 100 == 0:
                     print(f"Step [{step + 1}/{total_steps}]\tLoss {mean_loss}\tLr {optimizer.param_groups[0]['lr']}")
 
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+
+                random.shuffle(embed_indices)
         
             dst = os.path.join(ckpt_dir, "last.pt")
             torch.save(model.state_dict(), dst)
